@@ -1,0 +1,136 @@
+name: Construieste Unifil (din codul privat vertech2)
+
+# Rulează în acest repo PUBLIC (minute gratuite). Codul rămâne privat în luchianul/vertech2:
+# îl citește doar serverul, cu cheia VERTECH2_READ (doar citire). Nimic din cod nu apare aici.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['cere-construire.txt']
+
+permissions:
+  contents: write
+
+concurrency: { group: construire, cancel-in-progress: false }
+
+env:
+  OFFSET: 170        # numerele continuă după versiunea 163 de pe vechiul server (aplicațiile instalate trebuie să vadă un număr mai mare)
+
+jobs:
+  pregatire:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.s.outputs.sha }}
+      n: ${{ steps.s.outputs.n }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: s
+        run: |
+          SHA=$(tr -dc '0-9a-f' < cere-construire.txt | cut -c1-40)
+          [ -n "$SHA" ] || SHA=main
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "n=$(( ${{ github.run_number }} + OFFSET ))" >> $GITHUB_OUTPUT
+
+  teste:
+    needs: pregatire
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: luchianul/vertech2, ref: '${{ needs.pregatire.outputs.sha }}', token: '${{ secrets.VERTECH2_READ }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: |
+          npm install --no-save --no-audit --no-fund --ignore-scripts playwright@1.49.1
+          npx playwright install chromium
+          sudo timeout 240 npx playwright install-deps chromium || true
+          node tests/smoke.js
+          node tests/lic.js
+
+  web:
+    needs: [pregatire, teste]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: luchianul/vertech2, ref: '${{ needs.pregatire.outputs.sha }}', token: '${{ secrets.VERTECH2_READ }}', fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Pagina pentru iPad / iPhone
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          node tools/build.js
+          mkdir -p site && cp app/vertech.html site/index.html && cp pwa/* site/
+          V=$(git rev-parse HEAD | cut -c1-12)
+          sed -i "s/const WEB_VER = '';/const WEB_VER = '$V';/" site/index.html
+          echo "{\"v\":\"$V\"}" > site/version.json
+          DV=$(git rev-list --count HEAD); sed -i "s/const DATA_VER = 0;/const DATA_VER = $DV;/" site/index.html
+          touch site/.nojekyll
+          cd site && git init -q -b gh-pages && git config user.name github-actions && git config user.email actions@github.com
+          git add -A && git commit -q -m "Unifil web ${{ needs.pregatire.outputs.n }}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages
+
+  windows:
+    needs: [pregatire, teste]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: luchianul/vertech2, ref: '${{ needs.pregatire.outputs.sha }}', token: '${{ secrets.VERTECH2_READ }}', fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - shell: bash
+        run: |
+          N=${{ needs.pregatire.outputs.n }}
+          mkdir -p www && node tools/build.js www/index.html
+          sed -i "s#const UPD_REPO = 'luchianul/vertech2'#const UPD_REPO = 'luchianul/vertech-descarcari'#" www/index.html
+          sed -i 's#"repo": "vertech2"#"repo": "vertech-descarcari"#' package.json
+          sed -i "s/const APP_BUILD = 0;/const APP_BUILD = $N;/" www/index.html
+          DV=$(git rev-list --count HEAD); sed -i "s/const DATA_VER = 0;/const DATA_VER = $DV;/" www/index.html
+          npm version 1.0.$N --no-git-tag-version --allow-same-version
+          npm install --no-audit --no-fund
+          npx electron-builder --win --x64 --publish never
+      - uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ github.repository }}
+          tag_name: versiunea-${{ needs.pregatire.outputs.n }}
+          name: Versiunea ${{ needs.pregatire.outputs.n }}
+          files: |
+            dist/VerTech2-Setup.exe
+            dist/latest.yml
+            dist/VerTech2-Setup.exe.blockmap
+
+  android:
+    needs: [pregatire, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: luchianul/vertech2, ref: '${{ needs.pregatire.outputs.sha }}', token: '${{ secrets.VERTECH2_READ }}', fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - run: |
+          N=${{ needs.pregatire.outputs.n }}
+          mkdir -p www && node tools/build.js www/index.html
+          sed -i "s#const UPD_REPO = 'luchianul/vertech2'#const UPD_REPO = 'luchianul/vertech-descarcari'#" www/index.html
+          sed -i "s/const APP_BUILD = 0;/const APP_BUILD = $N;/" www/index.html
+          DV=$(git rev-list --count HEAD); sed -i "s/const DATA_VER = 0;/const DATA_VER = $DV;/" www/index.html
+          npm install --no-audit --no-fund --ignore-scripts
+          npx cap add android
+          pip install pillow
+          BUILD_NUM=$N python3 android-src/prepare_android.py
+          npx cap sync android
+          cd android && chmod +x gradlew && ./gradlew assembleDebug --no-daemon -q
+          cp app/build/outputs/apk/debug/app-debug.apk ../VerTech2-$N.apk
+          cd .. && keytool -printcert -jarfile VerTech2-$N.apk | grep -q "78:BA:60:CC:FF:D8:0F:F3:67:11:6A:D2:01:A3:04:58:82:3D:F3:38:84:DB:3B:89:F5:E9:EF:74:77:0D:C9:09"
+      - uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ github.repository }}
+          tag_name: versiunea-${{ needs.pregatire.outputs.n }}
+          name: Versiunea ${{ needs.pregatire.outputs.n }}
+          files: VerTech2-${{ needs.pregatire.outputs.n }}.apk
+      - name: Păstrează doar ultimele 5 versiuni
+        continue-on-error: true
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          gh api "repos/${{ github.repository }}/releases?per_page=100" --paginate -q '.[] | select(.tag_name|test("^versiunea-[0-9]+$")) | "\(.tag_name|ltrimstr("versiunea-")) \(.id) \(.tag_name)"' | sort -rn | tail -n +6 | while read n id t; do
+            gh api -X DELETE "repos/${{ github.repository }}/releases/$id" && gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$t" || true
+          done
